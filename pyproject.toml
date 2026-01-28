@@ -1,0 +1,15 @@
+[project]
+name = "patientprediction"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.5.0",
+    "ollama>=0.6.1",
+    "pandas>=3.0.0",
+    "pydantic>=2.12.5",
+    "scikit-learn<1.6",
+    "tabpfn>=2.0.3",
+    "tqdm>=4.67.1",
+    "xgboost>=3.1.3",
+]
