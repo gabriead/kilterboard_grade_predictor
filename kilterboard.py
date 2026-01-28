@@ -1,6 +1,6 @@
 import os
 
-# --- CRITICAL FIX FOR MAC (M1/M2/M3) ---
+# --- CRITICAL FIX FOR MAC ---
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -12,175 +12,168 @@ import json
 import re
 from datasets import load_dataset
 from sklearn.model_selection import StratifiedKFold
-from sklearn.utils import shuffle
+from sklearn.utils import resample
 from tabpfn import TabPFNClassifier
 from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score
 
 # ==========================================
-# 1. LOAD THE "GOLDEN KEY" (COORDINATE MAP)
+# 1. SETUP
 # ==========================================
-print("--- 1. LOADING COORDINATE MAP ---")
-
+MAX_HOLDS = 30  # Reduced slightly to focus on signal
+print("--- 1. LOADING MAP ---")
 try:
     with open('kilter_layout.json', 'r') as f:
-        layout_list = json.load(f)
-    HOLD_DB = {item['placement_id']: {'x': item['x'], 'y': item['y']} for item in layout_list}
-    print(f"✅ Successfully loaded real coordinates for {len(HOLD_DB)} holds.")
-except FileNotFoundError:
-    print("❌ ERROR: 'kilter_layout.json' not found.")
-    exit()
-except json.JSONDecodeError:
-    print("❌ ERROR: 'kilter_layout.json' contains invalid JSON.")
+        layout = json.load(f)
+    HOLD_DB = {i['placement_id']: {'x': i['x'], 'y': i['y']} for i in layout}
+    print(f"✅ Loaded {len(HOLD_DB)} coordinates.")
+except:
+    print("❌ Error loading kilter_layout.json");
     exit()
 
 
 # ==========================================
-# 2. PARSER
+# 2. HYBRID FEATURE ENGINEERING
 # ==========================================
-def parse_instruction(text):
-    if not isinstance(text, str): return {'difficulty': None, 'angle': None}
-    diff = re.search(r'difficulty (\d+)', text)
-    ang = re.search(r'angle (\d+)', text)
-    return {
-        'difficulty': int(diff.group(1)) if diff else None,
-        'angle': int(ang.group(1)) if ang else 40
-    }
-
-
-def parse_route(route_str):
-    if not isinstance(route_str, str): return []
-    matches = re.findall(r'p(\d+)r(\d+)', route_str)
-    holds = []
-    for pid, rid in matches:
-        coords = HOLD_DB.get(int(pid))
-        if coords:
-            holds.append({'id': int(pid), 'role': int(rid), 'x': coords['x'], 'y': coords['y']})
-    return holds
-
-
-# ==========================================
-# 3. FEATURE ENGINEERING
-# ==========================================
-def extract_features(row):
-    # Handle column name variations (HuggingFace vs Custom)
+def extract_hybrid_features(row):
+    # 1. Parse Inputs
     input_text = row.get('instruction') or row.get('input')
     target_text = row.get('output') or row.get('target')
 
-    meta = parse_instruction(input_text)
-    target_grade = meta['difficulty']
-    holds = parse_route(target_text)
+    diff_match = re.search(r'difficulty (\d+)', str(input_text))
+    ang_match = re.search(r'angle (\d+)', str(input_text))
+    if not diff_match: return None
 
-    if not holds or target_grade is None: return None
+    grade = int(diff_match.group(1))
+    angle = int(ang_match.group(1)) if ang_match else 40
 
+    # 2. Parse Holds
+    matches = re.findall(r'p(\d+)r(\d+)', str(target_text))
+    holds = []
+    for pid, rid in matches:
+        c = HOLD_DB.get(int(pid))
+        if c: holds.append({'x': c['x'], 'y': c['y'], 'r': int(rid)})
+
+    if len(holds) < 3: return None
+
+    # 3. CALCULATE PHYSICS "HINTS" (The Aggregate Features)
     df_h = pd.DataFrame(holds)
-    hands = df_h[df_h['role'].isin([12, 13, 14])]
-    feet = df_h[df_h['role'] == 15]
+    hands = df_h[df_h['r'].isin([12, 13, 14])]
 
-    if len(hands) < 2: return None
+    # Dimensions
+    h_span = (hands['y'].max() - hands['y'].min()) if len(hands) > 0 else 0
+    w_span = (hands['x'].max() - hands['x'].min()) if len(hands) > 0 else 0
 
-    # Physics Features
-    height = hands['y'].max() - hands['y'].min()
-    width = hands['x'].max() - hands['x'].min()
-
+    # Movement (Euclidean Distances)
     hands_sorted = hands.sort_values('y')
-    dists = np.sqrt(np.diff(hands_sorted['x']) ** 2 + np.diff(hands_sorted['y']) ** 2)
-    avg_move_dist = np.mean(dists) if len(dists) > 0 else 0
-    max_move_dist = np.max(dists) if len(dists) > 0 else 0
+    if len(hands_sorted) > 1:
+        dists = np.sqrt(np.diff(hands_sorted['x']) ** 2 + np.diff(hands_sorted['y']) ** 2)
+        avg_move = np.mean(dists)
+        max_move = np.max(dists)
+        crux_factor = max_move / (avg_move + 1)  # How much harder is the hardest move?
+    else:
+        avg_move, max_move, crux_factor = 0, 0, 0
 
-    area = (height * width) + 1
-    density = len(hands) / area
-    center_y = hands['y'].mean()
+    # Density
+    box_area = (h_span * w_span) + 1
+    density = len(hands) / box_area
 
-    return [
-        meta['angle'], len(hands), len(feet), width, height,
-        avg_move_dist, max_move_dist, density, center_y
-    ], target_grade
+    # 4. SEQUENCE EMBEDDING (The "Nuance" Features)
+    # Sort by height to align features
+    holds.sort(key=lambda k: (k['y'], k['x']))
+
+    # Vector Construction
+    # [ --- PHYSICS HINTS --- , --- RAW SEQUENCE --- ]
+    vector = [
+        angle,
+        len(hands),
+        h_span,
+        w_span,
+        avg_move,
+        max_move,
+        crux_factor,
+        density
+    ]
+
+    # Flatten sequence (X, Y, Role)
+    for i in range(MAX_HOLDS):
+        if i < len(holds):
+            h = holds[i]
+            # Normalize to ~0-1 range (Board is approx 150x150)
+            vector.extend([h['x'] / 150, h['y'] / 150, h['r'] / 15])
+        else:
+            vector.extend([0, 0, 0])  # Padding
+
+    return vector, grade, input_text
 
 
 # ==========================================
-# 4. DATA PREP & BALANCING
+# 3. PROCESSING & OVERSAMPLING
 # ==========================================
-print("\n--- 2. PROCESSING DATASET ---")
+print("\n--- 2. PROCESSING ---")
 dataset = load_dataset("gabriead/Kilterboard", split="train")
 
-X_raw, y_raw = [], []
-for i, row in enumerate(dataset):
-    if i > 5000: break  # Process more rows to ensure we have enough for balancing
-    result = extract_features(row)
-    if result:
-        X_raw.append(result[0])
-        y_raw.append(result[1])
+X_list, y_list, seen = [], [], set()
 
-# Create DataFrame for easy manipulation
-feature_names = ['Angle', 'N_Hands', 'N_Feet', 'Width', 'Height', 'Avg_Dist', 'Max_Dist', 'Density', 'Center_Y']
-df_full = pd.DataFrame(X_raw, columns=feature_names)
-# Bin grades: 0=Easy (<14), 1=Medium (14-22), 2=Hard (>22)
-df_full['grade_bin'] = [0 if g < 14 else (1 if g < 22 else 2) for g in y_raw]
+for row in dataset:
+    res = extract_hybrid_features(row)
+    if res:
+        vec, g, txt = res
+        if txt not in seen:  # Dedup
+            seen.add(txt)
+            X_list.append(vec)
+            y_list.append(g)
 
-print(f"Total samples extracted: {len(df_full)}")
-print(f"Class distribution before balancing:\n{df_full['grade_bin'].value_counts()}")
+# Binning
+y_binned = [0 if g < 14 else (1 if g < 22 else 2) for g in y_list]
+df = pd.DataFrame(X_list)
+df['target'] = y_binned
 
-# --- BALANCING (UNDERSAMPLING) ---
-print("\n--- BALANCING & SHUFFLING ---")
-min_class_size = df_full['grade_bin'].value_counts().min()
+print(f"Unique Samples: {len(df)}")
+print(f"Class Dist (Raw): {df['target'].value_counts().to_dict()}")
+
+print("\n--- 3. OVERSAMPLING (Maximizing Data) ---")
+# Instead of throwing away data (undersampling), we duplicate the small classes
+max_size = df['target'].value_counts().max()
+
 df_balanced = pd.concat([
-    df_full[df_full['grade_bin'] == label].sample(min_class_size, random_state=42)
-    for label in df_full['grade_bin'].unique()
+    resample(df[df['target'] == c], replace=True, n_samples=max_size, random_state=42)
+    for c in df['target'].unique()
 ])
+df_balanced = df_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
 
-# --- SHUFFLING ---
-df_balanced = shuffle(df_balanced, random_state=42).reset_index(drop=True)
+print(f"Training Size: {len(df_balanced)} ({max_size} per class)")
 
-X = df_balanced[feature_names].values
-y = df_balanced['grade_bin'].values
-
-print(f"Balanced dataset size: {len(df_balanced)} ({min_class_size} per class)")
+X = df_balanced.drop('target', axis=1).values
+y = df_balanced['target'].values
 
 # ==========================================
-# 5. STRATIFIED K-FOLD CROSS-VALIDATION
+# 4. BENCHMARK
 # ==========================================
-print("\n--- 3. CROSS-VALIDATION BENCHMARK ---")
-
-# 5-Fold Stratified Split ensures every fold has equal class proportions
+print("\n--- 4. RUNNING BENCHMARK ---")
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+pfn_scores, xgb_scores = [], []
 
-pfn_scores = []
-xgb_scores = []
-
-for fold, (train_idx, test_idx) in enumerate(skf.split(X, y)):
+for i, (train_idx, test_idx) in enumerate(skf.split(X, y)):
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
 
-    # --- TabPFN ---
-    # N_ensemble_configurations=4 is fast; use 32 for max accuracy in production
-    pfn = TabPFNClassifier(device='cpu')
+    # TabPFN (Increased ensemble for better complex feature handling)
+    # Using N=8 to keep speed reasonable, N=32 is best
+    pfn = TabPFNClassifier(device='cpu', N_ensemble_configurations=8)
     pfn.fit(X_train, y_train)
-    pfn_pred = pfn.predict(X_test)
-    pfn_acc = accuracy_score(y_test, pfn_pred)
+    pfn_acc = accuracy_score(y_test, pfn.predict(X_test))
     pfn_scores.append(pfn_acc)
 
-    # --- XGBoost ---
-    # Fixed parameters for Multi-Class classification
-    xgb = XGBClassifier(
-        n_jobs=1,  # Fix Mac crash
-        objective='multi:softmax',  # Fix logistic loss error
-        num_class=3,  # 3 Classes (Easy, Med, Hard)
-        eval_metric='mlogloss',  # Multi-class log loss
-        use_label_encoder=False
-    )
+    # XGBoost
+    xgb = XGBClassifier(n_jobs=1, objective='multi:softmax', num_class=3, eval_metric='mlogloss')
     xgb.fit(X_train, y_train)
-    xgb_pred = xgb.predict(X_test)
-    xgb_acc = accuracy_score(y_test, xgb_pred)
+    xgb_acc = accuracy_score(y_test, xgb.predict(X_test))
     xgb_scores.append(xgb_acc)
 
-    print(f"Fold {fold + 1}: TabPFN={pfn_acc:.2%} | XGBoost={xgb_acc:.2%}")
+    print(f"Fold {i + 1}: TabPFN={pfn_acc:.2%} | XGBoost={xgb_acc:.2%}")
 
-# ==========================================
-# 6. FINAL RESULTS
-# ==========================================
 print("-" * 40)
-print(f"AVERAGE ACCURACY (5-Fold CV)")
-print(f"TabPFN:  {np.mean(pfn_scores):.2%} (+/- {np.std(pfn_scores):.2%})")
-print(f"XGBoost: {np.mean(xgb_scores):.2%} (+/- {np.std(xgb_scores):.2%})")
+print(f"TabPFN Avg: {np.mean(pfn_scores):.2%} (+/- {np.std(pfn_scores):.2%})")
+print(f"XGBoost Avg: {np.mean(xgb_scores):.2%} (+/- {np.std(xgb_scores):.2%})")
 print("-" * 40)
