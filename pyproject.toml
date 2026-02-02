@@ -4,11 +4,17 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "boardlib>=0.14.0",
     "datasets>=4.5.0",
+    "matplotlib>=3.10.8",
     "ollama>=0.6.1",
+    "opencv-python>=4.13.0.90",
     "pandas>=3.0.0",
     "pydantic>=2.12.5",
     "scikit-learn<1.6",
+    "scipy-stubs~=1.17.0",
+    "seaborn>=0.13.2",
+    "shap>=0.49.1",
     "tabpfn>=2.0.3",
     "tqdm>=4.67.1",
     "xgboost>=3.1.3",
